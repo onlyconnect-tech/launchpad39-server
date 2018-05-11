@@ -1,147 +1,148 @@
 'use strict';
 
+const Promise = require('bluebird');
+
 const logger = require('./service/log_service');
+const mqtt = require('./lib/mqtt-lib.js');
+const configMqtt = require('./service/config_mqtt');
+const DroneInfo = require('./model/drone_info');
+const MsgsUtils = require('./util/msgs_utils');
 
-const ModuleController = require('./service/module_controller');
 
-const RedisService = require('./service/redis_service');
+var connectOpts = {
+    accessKey: configMqtt.accessKey,
+    clientId: `${Math.random().toString(36).substring(2,12)}`,      // 10-bit random string
+    endpoint: configMqtt.endpoint,
+    secretKey: configMqtt.secretKey,
+    // sessionToken: params.sessionToken,
+    regionName: configMqtt.regionName
+  };
 
-const RedisNotifierService = require('./service/redis_notifier');
+ const mqttController = new mqtt.ClientControllerCache();
 
-const Sessions = require('./model/sessions');
+  var cbs = {
+    onConnect: onConnect,
+    onSubSuccess: onSubSuccess,
+    onMessageArrived: onMessageArrived,
+    onConnectionLost: onConnectionLost
+};
 
-// first module controller for demo
+const clientController = mqttController.getClient(connectOpts, cbs);
+const droneInfo = new DroneInfo();
+ 
+function onConnect() {
+    
+    console.log('SONO ON CONNECT')
 
-//  ['demo', 'AAA', 'BBB']
+    clientController.subscribeByTopic('/request-vehicles/+');
+    clientController.subscribeByTopic('/+/commands');
+ }
 
-// default client for demo
+function doProcessRequestsVehiclesRequest(topicRequest) {
 
-var listClientNames = ['demo'];
+    var topicParts = topicRequest.split('/');
 
-var mapClients = new Map();
-var mapClientsCounter = new Map();
+    var customerID = topicParts[topicParts.length -1];
 
-const sessions = new Sessions();
+    console.log(customerID);
 
-function onLogin(customerID) {
-    logger.log('****************************');
-    logger.log('**** <<<<<------ LOGIN: ', customerID);
+    droneInfo.getListDroneInfoByCustomerID(customerID)
+    .then( function resolve(listDroneInfo) {
+        var queues = [];
 
-    if (!mapClients.has(customerID)) {
-        logger.log('info', '***************************');
-        logger.log('info', '******** ModuleController: customerName: ' + customerID + ' * ');
-        logger.log('info', '***************************');
+        listDroneInfo.forEach( function( elem ) {
+            queues.push({ id: elem.queue_name, type: elem.drone_type });
+        });
 
-        const moduleController = new ModuleController(customerID);
+        return queues;
+        }, function reject(err){
+            console.error('ERROR:', err);
+        }).then(function resolve(queues){
+            console.log("queues:", queues)
+            clientController.publishByTopic('/vehicles/' + customerID, queues);
 
-        moduleController.startDronePublisher();
+        });
+}
 
-        moduleController.startDroneServiceHistory();
+function doPreocessHistoryRequest(queueName) {
 
-        mapClients.set(customerID, moduleController);
-        mapClientsCounter.set(customerID, 1);
+    // send history
+    console.log('ASKING FOR HISTORY:', queueName);
+
+    /*
+    {"jsonrpc":"2.0","method":"history-response", "values": [ [], [], [], .....]}
+    */
+
+    //ask for a client from the pool
+
+    droneInfo.getDroneHistoryStatus(queueName).then( function resolve(results) {
+    
+        var values =  results.values;
+        var lastRecord = results.lastRecord;
+
+        var response = { jsonrpc: '2.0', method: 'history-response', values: values, lastRecord: lastRecord };
+
+        console.log('<<-- PUBLISHING:', response, ' ON QUEUE:', queueName);
+
+        clientController.publishByTopic(queueName + "/commands", response);
+
+        }, function reject(err) {
+
+        console.error(err);
+
+    });
+
+      
+
+}
+
+function onMessageArrived(data) {
+    
+    var msgPayload = data._message.toString('utf8');
+    var topic = data._topic;
+
+    console.log('MSG ARRIVE >>', topic , " - ", msgPayload)
+    // check if request-vehicles or history commands
+
+    if(topic.startsWith('/request-vehicles/')) {
+        doProcessRequestsVehiclesRequest(topic)
+    } else if (topic.endsWith('/commands')) {
+
+        let queueName = MsgsUtils.getQueueNamePart(topic);
+
+        var objPayload = null;
+        
+        try {
+            objPayload = JSON.parse(msgPayload);
+        } catch( excep){
+            console.error('ON payload:', msgPayload, '- eror:', excep);
+        }
+        
+
+        /*
+        {"jsonrpc":"2.0","method":"history" }
+        */
+        if(objPayload && objPayload.method === 'history') {
+            doPreocessHistoryRequest(queueName)
+        }
+
     } else {
-        // increment by 1
-        logger.log('INCREMENT COUNTER!!');
-
-        let counter = mapClientsCounter.get(customerID);
-        counter++;
-        mapClientsCounter.set(customerID, counter);
+        console.log('ANOTHER TOPIC')
     }
+
     
 
-}
-
-function onLogout(customerID) {
-    logger.log('****************************');
-    logger.log('**** LOGOUT: ', customerID,' ------>>>>');
-
-    const moduleController = mapClients.get(customerID);
-
-    if(moduleController) {
-        let counter = mapClientsCounter.get(customerID);
-        
-        logger.log('COUNTER:', counter);
-
-        if(counter == 1) {
-            logger.log('STOPPING MODULE_CONTROLLER');
-            // stop module controller
-            moduleController.stopDroneManager();
-            
-            moduleController.stopDronePublisher();
-
-            moduleController.stopDroneServiceHistory();
-
-            mapClients.delete(customerID);
-            mapClientsCounter.delete(customerID);
-        } else {
-            // decrement counter
-            logger.log('DECREMENTING COUNTER');
-            counter--;
-            mapClientsCounter.set(customerID, counter);
-        }
-    }
 
 }
 
-function onExpires(clientID) {
-    sessions.getOwnerCodeBySession(clientID).then( function resolve(session) {
-        var customerID = session.owners_code;
-
-        logger.log('****************************');
-        logger.log('**** EXPIRES: ', customerID ,' ------>>>>');
-
-        const moduleController = mapClients.get(customerID);
-
-        if(moduleController) {
-            let counter = mapClientsCounter.get(customerID);
-            
-            logger.log('COUNTER:', counter);
-
-            if(counter == 1) {
-                logger.log('STOPPING MODULE_CONTROLLER');
-                // stop module controller
-                moduleController.stopDroneManager();
-                
-                moduleController.stopDronePublisher();
-
-                moduleController.stopDroneService();
-
-                mapClients.delete(customerID);
-                mapClientsCounter.delete(customerID);
-            } else {
-                // decrement counter
-                logger.log('DECREMENTING COUNTER');
-                counter--;
-                mapClientsCounter.set(customerID, counter);
-            }
-        } // end if
-    }, function reject(err) {
-        logger.log('ERROR getting customerID from sessions - sessionID:', clientID, ' - ERR:', err);
-    });
+function onSubSuccess() {
+  
+    console.log('SONO ON SUB SUCCESS')
 }
 
-logger.info('********************************************');
-logger.info('** STARTING APPLICATION **');
-logger.info('********************************************');
-
-const redisService = new RedisService(onLogin, onLogout, logger);
-
-const redisNotifierService = new RedisNotifierService(onExpires);
-
-listClientNames.forEach(function (clientName) {
- 
-    logger.log('info', '***************************');
-    logger.log('info', '******** ModuleController: customerName: ' + clientName + ' * ');
-    logger.log('info', '***************************');
-
-    const moduleController = new ModuleController(clientName);
-
-    moduleController.startDronePublisher();
-
-    moduleController.startDroneServiceHistory();
-});
-
-
+function onConnectionLost() {
+  // do nothing
+  console.log('SONO ON CONNECT')
+}
 
 
