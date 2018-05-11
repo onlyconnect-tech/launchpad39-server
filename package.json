@@ -16,7 +16,7 @@
     "good-console": "^6.4.0",
     "good-squeeze": "^5.0.2",
     "moment": "^2.18.1",
-    "mqtt": "^2.6.2",
+    "mqtt": "^2.17.0",
     "pg": "^6.1.5",
     "redis-connection": "^5.4.0",
     "redis-notifier": "git://github.com/MassimoCappellano/redis-notifier.git",
